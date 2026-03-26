@@ -22,4 +22,8 @@ dependencies = [
     "tidybayes",
     "posterior",
     "duckdb",
+    "RSQLite",
+    "marginaleffects",
+    "gt",
+    "collapse",
 ]
