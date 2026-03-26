@@ -1,0 +1,158 @@
+---
+title: "Return-to-Play After Concussion"
+format: typst
+execute:
+  message: false
+  warning: false
+---
+
+```{r}
+library(tidyverse)
+library(brms)
+library(tidybayes)
+library(marginaleffects)
+```
+
+## Data
+
+One row per concussion event. Athletes with no concussions are excluded — they
+contribute no outcome to the model.
+
+```{r}
+rtp_data <- read_csv("data/concussion_data.csv", show_col_types = FALSE) |>
+  filter(!is.na(injury_date)) |>
+  mutate(
+    sex  = factor(sex, levels = c("M", "F")),
+    city = factor(city)
+  )
+
+glimpse(rtp_data)
+```
+
+## Model
+
+Lognormal regression for `days_to_rtp`. On the log scale, effects are additive
+and exponentiate to multiplicative shifts in median RTP days.
+
+Fixed effects:
+
+- `scat5_initial` — injury severity drives longer recovery
+- `sex` — female athletes recover more slowly at equivalent severity
+- `concussion_num` — each repeat concussion extends recovery
+
+Random effect:
+
+- `(1 | city)` — training center captures unexplained protocol variation across
+  the 8 centers
+
+```{r}
+#| output: false
+#|
+fit <- brm(
+  days_to_rtp ~ scat5_initial + sex + concussion_num + (1 | city),
+  family = lognormal(),
+  data = rtp_data,
+  chains = 4,
+  cores = 4,
+  backend = "cmdstan"
+)
+```
+
+```{r}
+summary(fit)
+```
+
+```{r}
+pp_check(fit)
+```
+
+## Fixed Effects
+
+Exponentiated coefficients are multiplicative factors on median RTP days. A
+coefficient of 1.22 means 22% longer recovery.
+
+```{r}
+fit |>
+  as_draws_df() |>
+  select(b_Intercept, b_scat5_initial, b_sexF, b_concussion_num) |>
+  pivot_longer(everything()) |>
+  mutate(value = exp(value)) |>
+  summarise(
+    median = median(value),
+    q2.5   = quantile(value, 0.025),
+    q97.5  = quantile(value, 0.975),
+    .by = name
+  ) |>
+  mutate(across(where(is.numeric), \(x) round(x, 3))) |>
+  arrange(desc(median)) |>
+  knitr::kable()
+```
+
+```{r}
+fit |>
+  as_draws_df() |>
+  select(b_scat5_initial, b_sexF, b_concussion_num) |>
+  pivot_longer(everything()) |>
+  mutate(name = case_match(
+    name,
+    "b_scat5_initial"  ~ "SCAT5 Initial",
+    "b_sexF"           ~ "Sex (Female)",
+    "b_concussion_num" ~ "Concussion #"
+  )) |>
+  ggplot(aes(exp(value), name)) +
+  stat_pointinterval() +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey50") +
+  labs(
+    x = "Multiplicative effect on median RTP days",
+    y = NULL,
+    title = "Posterior estimates: fixed effects on return-to-play duration"
+  )
+```
+
+## Sex Effect
+
+Marginal effect of sex on predicted RTP days, averaging over the observed
+distribution of severity and concussion history.
+
+```{r}
+avg_comparisons(fit, variables = "sex") |>
+  tibble() |>
+  select(contrast, estimate, conf.low, conf.high) |>
+  mutate(across(where(is.numeric), \(x) round(x, 1))) |>
+  knitr::kable()
+```
+
+## Training Center Random Effects
+
+Posterior estimates of each center's deviation from the population mean RTP,
+on the log scale. Positive values indicate longer-than-average RTP at that
+center after accounting for athlete severity and sex.
+
+```{r}
+fit |>
+  spread_draws(r_city[city, ]) |>
+  ungroup() |>
+  summarise(
+    median = median(r_city),
+    q2.5   = quantile(r_city, 0.025),
+    q97.5  = quantile(r_city, 0.975),
+    .by = city
+  ) |>
+  arrange(desc(median)) |>
+  mutate(across(where(is.numeric), \(x) round(x, 3))) |>
+  knitr::kable()
+```
+
+```{r}
+fit |>
+  spread_draws(r_city[city, ]) |>
+  ggplot(aes(r_city, reorder(city, r_city))) +
+  stat_pointinterval() +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  labs(
+    x = "Deviation from population mean log(RTP)",
+    y = NULL,
+    title = "Training center random effects",
+    subtitle = "Positive = longer RTP than average after adjusting for severity and sex"
+  )
+```

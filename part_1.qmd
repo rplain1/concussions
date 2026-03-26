@@ -1,0 +1,238 @@
+---
+title: "Part 1: Concussion Data Simulation"
+format: typst
+execute:
+  echo: false
+  message: false
+  warning: false
+---
+
+```{r}
+library(tidyverse)
+library(lubridate)
+
+con <- DBI::dbConnect(RSQLite::SQLite(), "data/athlete_data.db")
+
+athletes         <- tbl(con, "athletes")         |> collect()
+sport            <- tbl(con, "sport")            |> collect()
+elite_experience <- tbl(con, "elite_experience") |> collect()
+
+DBI::dbDisconnect(con)
+```
+
+```{r}
+# Effects simulated for Part 2 recovery:
+#   - Sex: female athletes have ~22% longer median RTP at equal severity
+#   - Training center: random intercept ~ N(0, 0.22²) on log scale,
+#     representing protocol variation across the 8 centers
+
+set.seed(52723)
+
+CONCUSSION_RATE <- 0.28
+
+sport_params <- tribble(
+  ~sport          , ~concussion_multiplier , ~severity_shift ,
+  "Rugby"         , 2.00                   ,  8L             ,
+  "Hockey"        , 1.60                   ,  5L             ,
+  "Lacrosse"      , 1.10                   ,  2L             ,
+  "Soccer"        , 0.90                   ,  0L             ,
+  "Flag Football" , 0.80                   , -3L             ,
+  "Basketball"    , 0.60                   , -5L             ,
+  "Baseball"      , 0.45                   , -8L             ,
+  "Softball"      , 0.45                   , -8L
+)
+
+weighted_mean_multiplier <- sport_params |>
+  inner_join(count(sport, sport), by = join_by(sport)) |>
+  summarise(sum(concussion_multiplier * n) / sum(n)) |>
+  pull()
+
+sport_params <- sport_params |>
+  mutate(concussion_multiplier = concussion_multiplier / weighted_mean_multiplier)
+
+training_centers <- athletes |>
+  distinct(city) |>
+  mutate(center_re = rnorm(n(), mean = 0, sd = 0.22))
+
+athlete_covariates <- athletes |>
+  select(athlete_id, sex, city) |>
+  inner_join(training_centers, by = join_by(city)) |>
+  mutate(sex_re = if_else(sex == "F", 0.20, 0.0))
+
+athlete_career_spans <- athletes |>
+  mutate(birthdate = as.Date(birthdate)) |>
+  mutate(career_start_year = year(birthdate) + 18L) |>
+  inner_join(
+    elite_experience |>
+      summarise(max_elite_year = max(elite_year), .by = athlete_id),
+    by = join_by(athlete_id)
+  ) |>
+  mutate(
+    career_start = make_date(career_start_year, 1, 1),
+    career_end   = make_date(career_start_year + max_elite_year - 1L, 11, 30)
+  ) |>
+  select(athlete_id, career_start, career_end)
+
+athlete_games <- elite_experience |>
+  summarise(total_games = sum(games_played), .by = athlete_id)
+
+mean_total_games <- mean(athlete_games$total_games)
+RATE_PER_GAME    <- CONCUSSION_RATE / mean_total_games
+
+mean_rtp_shift <- mean(athlete_covariates$sex_re + athlete_covariates$center_re)
+RTP_INTERCEPT  <- log(7) - mean_rtp_shift
+
+concussion_counts <- athletes |>
+  select(athlete_id) |>
+  inner_join(sport, by = join_by(athlete_id)) |>
+  inner_join(sport_params, by = join_by(sport)) |>
+  inner_join(athlete_games, by = join_by(athlete_id)) |>
+  mutate(
+    n_concussions = rpois(n(), lambda = RATE_PER_GAME * total_games * concussion_multiplier)
+  )
+
+concussion_events <- concussion_counts |>
+  filter(n_concussions > 0) |>
+  inner_join(athlete_career_spans, by = join_by(athlete_id)) |>
+  inner_join(athlete_covariates, by = join_by(athlete_id)) |>
+  mutate(concussion_num = map(n_concussions, seq_len)) |>
+  unnest(concussion_num) |>
+  mutate(
+    career_days   = as.integer(career_end - career_start),
+    injury_date   = career_start + map_int(career_days, \(d) sample.int(d, 1L)),
+    scat5_initial = as.integer(pmin(
+      pmax(round(rgamma(n(), shape = 5, scale = 8) + 5 + severity_shift), 5L), 132L
+    )),
+    severity_z    = (scat5_initial - 40) / 20,
+    days_to_rtp   = as.integer(pmax(ceiling(rlnorm(
+      n(),
+      meanlog = RTP_INTERCEPT + 0.3 * severity_z + 0.15 * (concussion_num - 1) + sex_re + center_re,
+      sdlog   = 0.65
+    )), 1L)),
+    return_to_play_date = injury_date + days_to_rtp,
+    scat5_return  = as.integer(pmin(
+      pmax(round(rgamma(n(), shape = 2, scale = 2.5) + 0.1 * scat5_initial), 0L),
+      scat5_initial
+    ))
+  ) |>
+  select(
+    athlete_id, concussion_num, injury_date, return_to_play_date,
+    days_to_rtp, scat5_initial, scat5_return
+  )
+
+concussions <- concussion_counts |>
+  select(athlete_id, sport, total_games) |>
+  left_join(concussion_events, by = join_by(athlete_id)) |>
+  left_join(athlete_covariates |> select(athlete_id, sex, city), by = join_by(athlete_id))
+
+concussion_events_only <- concussions |> filter(!is.na(injury_date))
+
+concussions |>
+  left_join(athletes |> select(athlete_id, height_cm, birthdate), by = join_by(athlete_id)) |>
+  select(
+    athlete_id, sex, height_cm, birthdate, city,
+    sport, total_games,
+    concussion_num, injury_date, return_to_play_date, days_to_rtp,
+    scat5_initial, scat5_return
+  ) |>
+  write_csv("data/concussion_data.csv")
+```
+
+
+## Overview
+
+### Simulation Assumptions
+
+- Athletes begin their elite career at age 18
+- Concussion counts follow $"Poisson"(0.28)$ per athlete
+- Days to return to play follow a log-normal distribution, median ≈ 9 days
+- SCAT5 scores range 0–132 (22 symptoms × 0–6 scale); initial score mean ≈ 40, return score mean ≈ 5
+
+### Simulation Added effects
+
+Sport drives the number of concussions
+- Each sport has a different multiplier effect to the number of concussions.
+- These are arbitrary values that follow what someone with minimal expertise would intuitively expect.
+
+Sex and Training Centers impact RTP
+- Female athletes have ~22% longer median RTP at equivalent severity
+- Training centers each carry a random effect ~ $Normal(0, 0.22^2)$ on the log RTP scale
+
+## Summary
+
+```{r}
+tibble(
+  Metric = c(
+    "Total athletes",
+    "Athletes with ≥1 concussion",
+    "Total concussions",
+    "Mean concussions per athlete",
+    "Median days to return to play",
+    "Median SCAT5 initial score",
+    "Median SCAT5 return score"
+  ),
+  Value = c(
+    as.character(nrow(athletes)),
+    as.character(n_distinct(concussion_events_only$athlete_id)),
+    as.character(nrow(concussion_events_only)),
+    as.character(round(nrow(concussion_events_only) / nrow(athletes), 2)),
+    as.character(median(concussion_events_only$days_to_rtp)),
+    as.character(round(median(concussion_events_only$scat5_initial), 1)),
+    as.character(round(median(concussion_events_only$scat5_return), 1))
+  )
+) |>
+  knitr::kable()
+```
+
+## By Sport
+
+
+```{r}
+concussions |>
+  summarise(
+    Athletes               = n_distinct(athlete_id),
+    Concussions            = sum(!is.na(injury_date)),
+    Rate                   = round(Concussions / Athletes, 2),
+    `Median SCAT5 Initial` = median(scat5_initial, na.rm = TRUE),
+    `Median SCAT5 Return`  = median(scat5_return,  na.rm = TRUE),
+    `Median Days to RTP`   = median(days_to_rtp,   na.rm = TRUE),
+    .by = sport
+  ) |>
+  arrange(desc(Rate)) |>
+  knitr::kable()
+```
+
+## By Sex
+
+```{r}
+concussions |>
+  summarise(
+    Athletes               = n_distinct(athlete_id),
+    Concussions            = sum(!is.na(injury_date)),
+    Rate                   = round(Concussions / Athletes, 2),
+    `Median SCAT5 Initial` = median(scat5_initial, na.rm = TRUE),
+    `Median SCAT5 Return`  = median(scat5_return,  na.rm = TRUE),
+    `Median Days to RTP`   = median(days_to_rtp,   na.rm = TRUE),
+    .by = sex
+  ) |>
+  arrange(sex) |>
+  knitr::kable()
+```
+
+## By Training Center
+
+```{r}
+concussions |>
+  summarise(
+    Athletes               = n_distinct(athlete_id),
+    Concussions            = sum(!is.na(injury_date)),
+    Rate                   = round(Concussions / Athletes, 2),
+    `Median SCAT5 Initial` = median(scat5_initial, na.rm = TRUE),
+    `Median SCAT5 Return`  = median(scat5_return,  na.rm = TRUE),
+    `Median Days to RTP`   = median(days_to_rtp,   na.rm = TRUE),
+    .by = city
+  ) |>
+  arrange(desc(`Median Days to RTP`)) |>
+  rename(`Training Center` = city) |>
+  knitr::kable()
+```
