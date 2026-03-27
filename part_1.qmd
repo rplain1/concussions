@@ -21,10 +21,9 @@ DBI::dbDisconnect(con)
 ```
 
 ```{r}
-# Effects simulated for Part 2 recovery:
-#   - Sex: female athletes have ~22% longer median RTP at equal severity
-#   - Training center: random intercept ~ N(0, 0.22²) on log scale,
-#     representing protocol variation across the 8 centers
+#' Effects simulated for Part 2 recovery:
+#'   - Sex
+#'   - Training center
 
 set.seed(52723)
 
@@ -42,6 +41,7 @@ sport_params <- tribble(
   "Softball"      , 0.45                   , -8L
 )
 
+# Adding sports multiplier effects
 weighted_mean_multiplier <- sport_params |>
   inner_join(count(sport, sport), by = join_by(sport)) |>
   summarise(sum(concussion_multiplier * n) / sum(n)) |>
@@ -54,10 +54,11 @@ training_centers <- athletes |>
   distinct(city) |>
   mutate(center_re = rnorm(n(), mean = 0, sd = 0.22))
 
+# Female random effect to capture in model
 athlete_covariates <- athletes |>
   select(athlete_id, sex, city) |>
   inner_join(training_centers, by = join_by(city)) |>
-  mutate(sex_re = if_else(sex == "F", 0.20, 0.0))
+  mutate(sex_re = if_else(sex == "F", 0.10, 0.0))
 
 athlete_career_spans <- athletes |>
   mutate(birthdate = as.Date(birthdate)) |>
@@ -79,9 +80,12 @@ athlete_games <- elite_experience |>
 mean_total_games <- mean(athlete_games$total_games)
 RATE_PER_GAME    <- CONCUSSION_RATE / mean_total_games
 
+# random effects
 mean_rtp_shift <- mean(athlete_covariates$sex_re + athlete_covariates$center_re)
+
 RTP_INTERCEPT  <- log(7) - mean_rtp_shift
 
+# Conncussions simulated on the aggregated level
 concussion_counts <- athletes |>
   select(athlete_id) |>
   inner_join(sport, by = join_by(athlete_id)) |>
@@ -91,6 +95,7 @@ concussion_counts <- athletes |>
     n_concussions = rpois(n(), lambda = RATE_PER_GAME * total_games * concussion_multiplier)
   )
 
+# Turn each concussion into an event
 concussion_events <- concussion_counts |>
   filter(n_concussions > 0) |>
   inner_join(athlete_career_spans, by = join_by(athlete_id)) |>
@@ -106,8 +111,8 @@ concussion_events <- concussion_counts |>
     severity_z    = (scat5_initial - 40) / 20,
     days_to_rtp   = as.integer(pmax(ceiling(rlnorm(
       n(),
-      meanlog = RTP_INTERCEPT + 0.3 * severity_z + 0.15 * (concussion_num - 1) + sex_re + center_re,
-      sdlog   = 0.65
+      meanlog = RTP_INTERCEPT + (0.25 * severity_z) + (0.35 * (concussion_num - 1)) + sex_re + center_re,
+      sdlog   = 0.5
     )), 1L)),
     return_to_play_date = injury_date + days_to_rtp,
     scat5_return  = as.integer(pmin(
