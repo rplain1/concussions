@@ -26,4 +26,6 @@ dependencies = [
     "marginaleffects",
     "gt",
     "collapse",
+    "patchwork",
+    "ggtext",
 ]
