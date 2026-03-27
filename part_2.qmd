@@ -4,6 +4,7 @@ format: typst
 execute:
   message: false
   warning: false
+  echo: false
 ---
 
 ```{r}
@@ -11,91 +12,166 @@ library(tidyverse)
 library(brms)
 library(tidybayes)
 library(marginaleffects)
+library(patchwork)
 ```
+
+## Executive Summary
+
+The following analysis was done on athlete concussion data, with the intent to understand the number of days for players to return to play (RTP) following a concussion. The data included 200 athletes across 10,177 total games. In the sample there were 50 athletes that suffered a concussion with a total of 63 concussions.
+
+### Key insights include:
+
+- Females have higher associated days before RTP.
+- A 10-point increase in the initial SCAT5 is associated with roughly a 1.6 day increase in days to RTP.
+- **There is inconsistency across training facilities in days prior to RTP, after controlling for severity and sex**.
+
+### Recommendation
+
+Each training facility should standardize on days to RTP with a guideline on the initial SCAT5 score.
 
 ## Data
 
-One row per concussion event. Athletes with no concussions are excluded — they
-contribute no outcome to the model.
+The table below shows a sample of the concussion records used in this analysis.
 
 ```{r}
 rtp_data <- read_csv("data/concussion_data.csv", show_col_types = FALSE) |>
   filter(!is.na(injury_date)) |>
   mutate(
-    sex  = factor(sex, levels = c("M", "F")),
+    sex = factor(sex, levels = c("M", "F")),
     city = factor(city)
   )
 
-glimpse(rtp_data)
+rtp_data <- rtp_data |>
+  mutate(scat5_initial_z = scale(scat5_initial)[, 1])
+
+
+rtp_data |> head() |> knitr::kable()
+
 ```
 
 ## Model
 
-Lognormal regression for `days_to_rtp`. On the log scale, effects are additive
-and exponentiate to multiplicative shifts in median RTP days.
+Days to RTP were modeled with a log-normal regression. Outcomes are normally distributed on the log scale, so the effects are additive there and exponentiate to multiplicative shifts in RTP days. The parameters included were as follows:
 
 Fixed effects:
 
-- `scat5_initial` — injury severity drives longer recovery
-- `sex` — female athletes recover more slowly at equivalent severity
-- `concussion_num` — each repeat concussion extends recovery
+- `scat5_initial` — injury severity at onset of concussion
+- `sex` — female / male
+- `concussion_num` — how many concussions the athlete had prior to the event
 
 Random effect:
 
-- `(1 | city)` — training center captures unexplained protocol variation across
-  the 8 centers
+- `(1 | city)` — training center
+
+### Model Justification
+
+Due to a small sample size of concussion events, a Bayesian general linear regression model was implemented. This allows incorporation of priors, and provides uncertainty with the small sample size of data.
+
+Rather than single point estimates, Bayesian inference yields a full posterior distribution for each parameter, giving a more honest picture of uncertainty given the limited number of concussion events.
 
 ```{r}
 #| output: false
-#|
-fit <- brm(
-  days_to_rtp ~ scat5_initial + sex + concussion_num + (1 | city),
+fit_prior <- brm(
+  days_to_rtp ~ scat5_initial_z + sex + concussion_num + (1 | city),
   family = lognormal(),
   data = rtp_data,
+  prior = c(
+    prior(normal(2, 0.5), class = Intercept), # ~8-9 days
+    prior(normal(0, 0.5), class = b),
+    prior(normal(0, 0.5), class = sd),
+    prior(normal(0, 0.5), class = sigma)
+  ),
   chains = 4,
   cores = 4,
-  backend = "cmdstan"
+  backend = "cmdstan",
+  sample_prior = 'only',
+  control = list(adapt_delta = 0.95),
+  seed = 52723
 )
 ```
 
 ```{r}
-summary(fit)
+#| output: false
+
+# I followed this workflow of prior predictive checks.
+pp_check(fit_prior)
 ```
 
 ```{r}
-pp_check(fit)
+#| output: false
+fit <- update(fit_prior, sample_prior = "no")
+```
+
+Each line represents a draw from the predictive distribution. The prior encodes the expectation that RTP is typically around 9 days and rarely exceeds 30 — uncertain, but within a plausible range. The posterior then updates on the observed data, converging on a distribution that closely matches the observed RTP.
+
+```{r}
+set.seed(527)
+n_draws <- 50
+
+tidy_yrep <- function(model, label, n) {
+  posterior_predict(model, ndraws = n) |>
+    as_tibble(.name_repair = ~ paste0("obs", seq_along(.))) |>
+    mutate(draw = row_number(), source = label) |>
+    pivot_longer(-c(draw, source), values_to = "days_to_rtp")
+}
+
+yrep_df <- bind_rows(
+  tidy_yrep(fit_prior, "Prior predictive", n_draws),
+  tidy_yrep(fit, "Posterior predictive", n_draws)
+)
+
+obs_df <- tibble(days_to_rtp = rtp_data$days_to_rtp)
+
+yrep_prior <- yrep_df |> filter(source == "Prior predictive")
+yrep_post <- yrep_df |> filter(source == "Posterior predictive")
+library(ggtext)
+
+title_str <- "<span style='color:#1e47dc93'>**Prior**</span> → <span style='color:#e34646'>**Posterior**</span> Predictive Update"
+ggplot(mapping = aes(days_to_rtp, group = draw)) +
+  geom_density(
+    data = yrep_prior,
+    color = "#1e47dc93",
+    linewidth = 0.3,
+    alpha = 0.3
+  ) +
+  geom_density(
+    data = yrep_post,
+    color = "#e34646",
+    linewidth = 0.3,
+    alpha = 0.6
+  ) +
+  geom_density(
+    data = obs_df,
+    aes(days_to_rtp, group = NULL),
+    color = "black",
+    linewidth = 1,
+    linetype = 'dashed'
+  ) +
+  coord_cartesian(xlim = c(0, 100)) +
+  labs(
+    x = "Days to RTP",
+    y = "Density",
+    title = title_str,
+    subtitle = ("Dashed line is the observed distribution")
+  ) +
+  theme(plot.title = element_markdown())
 ```
 
 ## Fixed Effects
 
-Exponentiated coefficients are multiplicative factors on median RTP days. A
-coefficient of 1.22 means 22% longer recovery.
+Exponentiated coefficients are multiplicative factors on RTP days. A
+coefficient of 1.2 means 20% longer recovery.
+
+The posterior distributions of each fixed effect are shown below.
 
 ```{r}
 fit |>
   as_draws_df() |>
-  select(b_Intercept, b_scat5_initial, b_sexF, b_concussion_num) |>
-  pivot_longer(everything()) |>
-  mutate(value = exp(value)) |>
-  summarise(
-    median = median(value),
-    q2.5   = quantile(value, 0.025),
-    q97.5  = quantile(value, 0.975),
-    .by = name
-  ) |>
-  mutate(across(where(is.numeric), \(x) round(x, 3))) |>
-  arrange(desc(median)) |>
-  knitr::kable()
-```
-
-```{r}
-fit |>
-  as_draws_df() |>
-  select(b_scat5_initial, b_sexF, b_concussion_num) |>
+  select(b_scat5_initial_z, b_sexF, b_concussion_num) |>
   pivot_longer(everything()) |>
   mutate(name = case_match(
     name,
-    "b_scat5_initial"  ~ "SCAT5 Initial",
+    "b_scat5_initial_z"  ~ "SCAT5 Initial",
     "b_sexF"           ~ "Sex (Female)",
     "b_concussion_num" ~ "Concussion #"
   )) |>
@@ -109,18 +185,41 @@ fit |>
   )
 ```
 
-## Sex Effect
+## Interpretations
 
-Marginal effect of sex on predicted RTP days, averaging over the observed
-distribution of severity and concussion history.
+The fixed effects above are on the log scale. Marginal effects translate these into interpretable differences in days, averaged over the observed distribution of the other covariates.
+
+### Sex
 
 ```{r}
 avg_comparisons(fit, variables = "sex") |>
   tibble() |>
-  select(contrast, estimate, conf.low, conf.high) |>
+  select(contrast, days_to_rtp = estimate, conf.low, conf.high) |>
   mutate(across(where(is.numeric), \(x) round(x, 1))) |>
   knitr::kable()
 ```
+
+Females average 1.4 more days to RTP than males, after averaging over the observed distribution of injury severity and concussion history.
+
+### SCAT5
+
+`scat5_initial` was standardized for modeling. The table rescales the effect back to the original score units.
+
+```{r}
+scale_factor <- 10 / sd(rtp_data$scat5_initial)
+
+scat5_comp <- avg_comparisons(fit, variables = "scat5_initial_z") |>
+  tibble() |>
+  select(contrast, days_to_rtp = estimate, conf.low, conf.high) |>
+  mutate(
+    across(where(is.numeric), \(x) round(x * scale_factor, 1)),
+    contrast = "+10 points (raw)"
+  )
+
+scat5_comp |> knitr::kable()
+```
+
+Each 10-point increase in initial SCAT5 score is associated with an additional 1.6 days to RTP.
 
 ## Training Center Random Effects
 
@@ -128,20 +227,6 @@ Posterior estimates of each center's deviation from the population mean RTP,
 on the log scale. Positive values indicate longer-than-average RTP at that
 center after accounting for athlete severity and sex.
 
-```{r}
-fit |>
-  spread_draws(r_city[city, ]) |>
-  ungroup() |>
-  summarise(
-    median = median(r_city),
-    q2.5   = quantile(r_city, 0.025),
-    q97.5  = quantile(r_city, 0.975),
-    .by = city
-  ) |>
-  arrange(desc(median)) |>
-  mutate(across(where(is.numeric), \(x) round(x, 3))) |>
-  knitr::kable()
-```
 
 ```{r}
 fit |>
@@ -153,6 +238,47 @@ fit |>
     x = "Deviation from population mean log(RTP)",
     y = NULL,
     title = "Training center random effects",
-    subtitle = "Positive = longer RTP than average after adjusting for severity and sex"
+    subtitle = "Positive = longer RTP than average"
   )
+```
+
+
+
+
+The plot below shows the expected RTP for a female athlete at median injury severity, broken down by training center. This makes the random effects interpretable on the original day scale.
+
+```{r}
+fit |>
+  epred_draws(
+    newdata = datagrid(
+      model = fit,
+      city = unique(rtp_data$city),
+      scat5_initial = median(rtp_data$scat5_initial_z),
+      concussion_num = 1,
+      sex = "F"
+    )
+  ) |>
+  ggplot(aes(x = .epred, y = reorder(city, .epred))) +
+  stat_pointinterval() +
+  geom_vline(xintercept = median(rtp_data$days_to_rtp), linetype = "dashed") +
+  labs(x = "Adjusted median days to RTP", y = NULL)
+```
+
+Comparing male and female athletes side by side shows the consistent sex difference across all centers.
+
+```{r}
+fit |>
+  epred_draws(
+    newdata = datagrid(
+      model = fit,
+      city = unique(rtp_data$city),
+      scat5_initial_z = median(rtp_data$scat5_initial_z),
+      concussion_num = 1,
+      sex = c("M", "F")
+    )
+  ) |>
+  ggplot(aes(x = .epred, y = reorder(city, .epred), color = sex)) +
+  stat_pointinterval(position = position_dodge(width = 0.5)) +
+  geom_vline(xintercept = median(rtp_data$days_to_rtp), linetype = "dashed") +
+  labs(x = "Adjusted median days to RTP", y = NULL, color = "Sex")
 ```
