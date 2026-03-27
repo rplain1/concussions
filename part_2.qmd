@@ -17,23 +17,21 @@ library(patchwork)
 
 ## Executive Summary
 
-The following analysis was done on athlete concussion data, with the intent to understand the number of days for players to return to play (RTP) following a concussion. The data included 200 athletes across 10,177 total games. In the sample there were 50 athletes that suffered a concussion with a total of 63 concussions.
+This report examines how long athletes take to return to play (RTP) following a concussion. Across 200 athletes and 10,177 games, 50 athletes sustained a concussion — 63 events in total.
 
-### Key insights include:
+#### Key Findings
 
-- Females have higher associated days before RTP.
-- A 10-point increase in the initial SCAT5 is associated with roughly a 1.6 day increase in days to RTP.
-- **There is inconsistency across training facilities in days prior to RTP, after controlling for severity and sex**.
+- Female athletes take longer to return to play than male athletes — approximately 1.4 days longer on average.
+- Higher initial SCAT5 scores predict longer recovery: each 10-point increase adds roughly 1.6 days before clearance.
+- Return-to-play timelines differ meaningfully across training centers, even after accounting for injury severity and sex. **This points to inconsistent clearance practices rather than differences in the athletes themselves**.
 
-### Recommendation
+#### Recommendation
 
-Each training facility should standardize on days to RTP with a guideline on the initial SCAT5 score.
+Training centers should adopt a shared, protocol-driven clearance process that explicitly incorporates initial SCAT5 score. Without a common standard, return-to-play decisions are being made inconsistently — exposing some athletes to premature clearance and others to unnecessarily prolonged restriction.
 
-## Data
-
-The table below shows a sample of the concussion records used in this analysis.
 
 ```{r}
+#| output: false
 rtp_data <- read_csv("data/concussion_data.csv", show_col_types = FALSE) |>
   filter(!is.na(injury_date)) |>
   mutate(
@@ -45,29 +43,18 @@ rtp_data <- rtp_data |>
   mutate(scat5_initial_z = scale(scat5_initial)[, 1])
 
 
-rtp_data |> head() |> knitr::kable()
+rtp_data |> head()
 
 ```
 
 ## Model
 
-Days to RTP were modeled with a log-normal regression. Outcomes are normally distributed on the log scale, so the effects are additive there and exponentiate to multiplicative shifts in RTP days. The parameters included were as follows:
+Recovery time was modeled as a function of three athlete-level factors and one facility-level factor:
 
-Fixed effects:
-
-- `scat5_initial` — injury severity at onset of concussion
-- `sex` — female / male
-- `concussion_num` — how many concussions the athlete had prior to the event
-
-Random effect:
-
-- `(1 | city)` — training center
-
-### Model Justification
-
-Due to a small sample size of concussion events, a Bayesian general linear regression model was implemented. This allows incorporation of priors, and provides uncertainty with the small sample size of data.
-
-Rather than single point estimates, Bayesian inference yields a full posterior distribution for each parameter, giving a more honest picture of uncertainty given the limited number of concussion events.
+- **Initial injury severity** (SCAT5 score at time of concussion)
+- **Sex** (female / male)
+- **Concussion history** (number of prior concussions)
+- **Training center** (to detect facility-level variation after adjusting for the above)
 
 ```{r}
 #| output: false
@@ -102,7 +89,113 @@ pp_check(fit_prior)
 fit <- update(fit_prior, sample_prior = "no")
 ```
 
-Each line represents a draw from the predictive distribution. The prior encodes the expectation that RTP is typically around 9 days and rarely exceeds 30 — uncertain, but within a plausible range. The posterior then updates on the observed data, converging on a distribution that closely matches the observed RTP.
+## Factors Affecting Recovery Time
+
+The chart below shows each factor's estimated effect on days to return to play. Points to the right of the dashed line indicate longer recovery; points to the left indicate shorter recovery. The horizontal bars represent uncertainty — wider bars mean the data are less conclusive about that factor.
+
+```{r}
+fit |>
+  as_draws_df() |>
+  select(b_scat5_initial_z, b_sexF, b_concussion_num) |>
+  pivot_longer(everything()) |>
+  mutate(name = case_match(
+    name,
+    "b_scat5_initial_z"  ~ "SCAT5 Initial",
+    "b_sexF"           ~ "Sex (Female)",
+    "b_concussion_num" ~ "Concussion #"
+  )) |>
+  ggplot(aes(exp(value), name)) +
+  stat_pointinterval() +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey50") +
+  labs(
+    x = "Relative effect on recovery time (values > 1 = longer recovery)",
+    y = NULL,
+    title = "Estimated effect of each factor on return-to-play duration"
+  )
+```
+
+## Effect Sizes in Days
+
+The estimates below translate the chart above into concrete differences in recovery time, averaged across all athletes in the sample.
+
+#### Sex
+
+```{r}
+avg_comparisons(fit, variables = "sex") |>
+  tibble() |>
+  select(contrast, days_to_rtp = estimate, conf.low, conf.high) |>
+  mutate(
+    across(where(is.numeric), \(x) round(x, 1)),
+    contrast = "Female vs. Male",
+  ) |>
+  knitr::kable()
+```
+
+Females average 1.4 more days to RTP than males, after averaging over the observed distribution of injury severity and concussion history.
+
+#### SCAT5
+
+```{r}
+scale_factor <- 10 / sd(rtp_data$scat5_initial)
+
+scat5_comp <- avg_comparisons(fit, variables = "scat5_initial_z") |>
+  tibble() |>
+  select(contrast, days_to_rtp = estimate, conf.low, conf.high) |>
+  mutate(
+    across(where(is.numeric), \(x) round(x * scale_factor, 1)),
+    contrast = "+10 points (raw)"
+  )
+
+scat5_comp |> knitr::kable()
+```
+
+Each 10-point increase in initial SCAT5 score is associated with an additional 1.6 days to RTP.
+
+## Variation Across Training Centers
+
+After adjusting for athlete severity and sex, there is meaningful variation in recovery time across training centers. The chart below shows each center's deviation from the average — centers to the right of the dashed line are clearing athletes to return later than expected, and centers to the left are clearing athletes earlier.
+
+
+```{r}
+fit |>
+  spread_draws(r_city[city, ]) |>
+  ggplot(aes(r_city, reorder(city, r_city))) +
+  stat_pointinterval() +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  labs(
+    x = "Deviation from average recovery time (adjusted)",
+    y = NULL,
+    title = "Recovery time by training center, adjusted for athlete severity and sex",
+    subtitle = "Right of dashed line = longer than average recovery"
+  )
+```
+
+The chart below shows the expected days to return to play for a female athlete at median injury severity, broken out by training center.
+
+```{r}
+fit |>
+  epred_draws(
+    newdata = datagrid(
+      model = fit,
+      city = unique(rtp_data$city),
+      scat5_initial = median(rtp_data$scat5_initial_z),
+      concussion_num = 1,
+      sex = "F"
+    )
+  ) |>
+  ggplot(aes(x = .epred, y = reorder(city, .epred))) +
+  stat_pointinterval() +
+  geom_vline(xintercept = median(rtp_data$days_to_rtp), linetype = "dashed") +
+  labs(x = "Adjusted median days to RTP", y = NULL)
+```
+
+## Appendix: Methodology
+
+### Why a Bayesian Approach
+
+With only 63 concussion events in the sample, a standard model would produce unreliably wide estimates. A Bayesian approach addresses this by combining the observed data with reasonable prior expectations — for example, that most athletes return to play within 30 days. The result is a range of plausible outcomes rather than a single number, giving a more honest picture of what the data can and cannot tell us.
+
+The chart below shows the model's starting expectations (blue) versus its updated estimates after seeing the data (red). The dashed line is the actual observed distribution. The red curves closely track the observed data, indicating a well-calibrated model.
 
 ```{r}
 set.seed(527)
@@ -155,130 +248,4 @@ ggplot(mapping = aes(days_to_rtp, group = draw)) +
     subtitle = ("Dashed line is the observed distribution")
   ) +
   theme(plot.title = element_markdown())
-```
-
-## Fixed Effects
-
-Exponentiated coefficients are multiplicative factors on RTP days. A
-coefficient of 1.2 means 20% longer recovery.
-
-The posterior distributions of each fixed effect are shown below.
-
-```{r}
-fit |>
-  as_draws_df() |>
-  select(b_scat5_initial_z, b_sexF, b_concussion_num) |>
-  pivot_longer(everything()) |>
-  mutate(name = case_match(
-    name,
-    "b_scat5_initial_z"  ~ "SCAT5 Initial",
-    "b_sexF"           ~ "Sex (Female)",
-    "b_concussion_num" ~ "Concussion #"
-  )) |>
-  ggplot(aes(exp(value), name)) +
-  stat_pointinterval() +
-  geom_vline(xintercept = 1, linetype = "dashed", color = "grey50") +
-  labs(
-    x = "Multiplicative effect on median RTP days",
-    y = NULL,
-    title = "Posterior estimates: fixed effects on return-to-play duration"
-  )
-```
-
-## Interpretations
-
-The fixed effects above are on the log scale. Marginal effects translate these into interpretable differences in days, averaged over the observed distribution of the other covariates.
-
-### Sex
-
-```{r}
-avg_comparisons(fit, variables = "sex") |>
-  tibble() |>
-  select(contrast, days_to_rtp = estimate, conf.low, conf.high) |>
-  mutate(across(where(is.numeric), \(x) round(x, 1))) |>
-  knitr::kable()
-```
-
-Females average 1.4 more days to RTP than males, after averaging over the observed distribution of injury severity and concussion history.
-
-### SCAT5
-
-`scat5_initial` was standardized for modeling. The table rescales the effect back to the original score units.
-
-```{r}
-scale_factor <- 10 / sd(rtp_data$scat5_initial)
-
-scat5_comp <- avg_comparisons(fit, variables = "scat5_initial_z") |>
-  tibble() |>
-  select(contrast, days_to_rtp = estimate, conf.low, conf.high) |>
-  mutate(
-    across(where(is.numeric), \(x) round(x * scale_factor, 1)),
-    contrast = "+10 points (raw)"
-  )
-
-scat5_comp |> knitr::kable()
-```
-
-Each 10-point increase in initial SCAT5 score is associated with an additional 1.6 days to RTP.
-
-## Training Center Random Effects
-
-Posterior estimates of each center's deviation from the population mean RTP,
-on the log scale. Positive values indicate longer-than-average RTP at that
-center after accounting for athlete severity and sex.
-
-
-```{r}
-fit |>
-  spread_draws(r_city[city, ]) |>
-  ggplot(aes(r_city, reorder(city, r_city))) +
-  stat_pointinterval() +
-  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
-  labs(
-    x = "Deviation from population mean log(RTP)",
-    y = NULL,
-    title = "Training center random effects",
-    subtitle = "Positive = longer RTP than average"
-  )
-```
-
-
-
-
-The plot below shows the expected RTP for a female athlete at median injury severity, broken down by training center. This makes the random effects interpretable on the original day scale.
-
-```{r}
-fit |>
-  epred_draws(
-    newdata = datagrid(
-      model = fit,
-      city = unique(rtp_data$city),
-      scat5_initial = median(rtp_data$scat5_initial_z),
-      concussion_num = 1,
-      sex = "F"
-    )
-  ) |>
-  ggplot(aes(x = .epred, y = reorder(city, .epred))) +
-  stat_pointinterval() +
-  geom_vline(xintercept = median(rtp_data$days_to_rtp), linetype = "dashed") +
-  labs(x = "Adjusted median days to RTP", y = NULL)
-```
-
-Comparing male and female athletes side by side shows the consistent sex difference across all centers.
-
-```{r}
-fit |>
-  epred_draws(
-    newdata = datagrid(
-      model = fit,
-      city = unique(rtp_data$city),
-      scat5_initial_z = median(rtp_data$scat5_initial_z),
-      concussion_num = 1,
-      sex = c("M", "F")
-    )
-  ) |>
-  ggplot(aes(x = .epred, y = reorder(city, .epred), color = sex)) +
-  stat_pointinterval(position = position_dodge(width = 0.5)) +
-  geom_vline(xintercept = median(rtp_data$days_to_rtp), linetype = "dashed") +
-  labs(x = "Adjusted median days to RTP", y = NULL, color = "Sex")
 ```
